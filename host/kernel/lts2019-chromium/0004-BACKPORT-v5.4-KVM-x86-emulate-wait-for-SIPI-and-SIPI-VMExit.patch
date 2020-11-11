@@ -1,20 +1,14 @@
-From 4023b3385de2f39d7c87b67b06e2dc966ac3cdc5 Mon Sep 17 00:00:00 2001
+From 9f18399485bdd5b2724393834087ff4e35ca87a7 Mon Sep 17 00:00:00 2001
 From: Yadong Qi <yadong.qi@intel.com>
-Date: Thu, 3 Sep 2020 16:20:10 +0800
-Subject: [PATCH 2/2] KVM: x86: emulate wait-for-SIPI and SIPI-VMExit
+Date: Fri, 6 Nov 2020 14:51:22 +0800
+Subject: [PATCH 4/4] KVM: x86: emulate wait-for-SIPI and SIPI-VMExit
 
 Background: We have a lightweight HV, it needs INIT-VMExit and
-SIPI-VMExit to wake-up APs for guests since it do not monitoring
+SIPI-VMExit to wake-up APs for guests since it do not monitor
 the Local APIC. But currently virtual wait-for-SIPI(WFS) state
-is not supported in KVM, so when running on top of KVM, the L1
+is not supported in nVMX, so when running on top of KVM, the L1
 HV cannot receive the INIT-VMExit and SIPI-VMExit which cause
 the L2 guest cannot wake up the APs.
-
-This patch is incomplete, it emulated wait-for-SIPI state by halt
-the vCPU and emulated SIPI-VMExit to L1 when trapped SIPI signal
-from L2. I am posting it RFC to gauge whether or not upstream
-KVM is interested in emulating wait-for-SIPI state before
-investing the time to finish the full support.
 
 According to Intel SDM Chapter 25.2 Other Causes of VM Exits,
 SIPIs cause VM exits when a logical processor is in
@@ -25,12 +19,11 @@ In this patch:
     2. introduce wait-for-SIPI state for nVMX,
     3. advertise wait-for-SIPI support to guest.
 
-When L1 hypervisor do not trap Local APIC, L0 need to emulate
+When L1 hypervisor is not monitoring Local APIC, L0 need to emulate
 INIT-VMExit and SIPI-VMExit to L1 to emulate INIT-SIPI-SIPI for
-L2.
-L2 guest would be traped by L0 Hypervisor(KVM), L0 should emulate
-the INIT-SIPI-SIPI vmexit to L1 hypervisor to set proper state for
-L2's vcpu state.
+L2. L2 LAPIC write would be traped by L0 Hypervisor(KVM), L0 should
+emulate the INIT/SIPI vmexit to L1 hypervisor to set proper state
+for L2's vcpu state.
 
 Handle procdure:
 Source vCPU:
@@ -40,26 +33,29 @@ Source vCPU:
 Target vCPU:
     L0 emulate an INIT VMExit to L1 if is guest mode.
     L1 set guest VMCS, guest_activity_state=WAIT_SIPI, vmresume.
-    L0 halt vCPU if (vmcs12.guest_activity_state == WAIT_SIPI).
+    L0 set vcpu.mp_state to INIT_RECEIVED if (vmcs12.guest_activity_state
+       == WAIT_SIPI).
 
 Source vCPU:
     L2 write LAPIC.ICR(SIPI).
     L0 trap LAPIC.ICR write(INIT): inject a latched SIPI event to traget
        vCPU.
 Target vCPU:
-    L0 emulate an SIPI VMExit to L1 if (vmcs12.guest_activity_state ==
-       WAIT_SIPI).
-    L1 set CS:IP, guest_activity_state=ACTIVE, vmresume
-    L0 resume to L2
-    L2 start-up
+    L0 emulate an SIPI VMExit to L1 if (vcpu.mp_state == INIT_RECEIVED).
+    L1 set CS:IP, guest_activity_state=ACTIVE, vmresume.
+    L0 resume to L2.
+    L2 start-up.
 
 Signed-off-by: Yadong Qi <yadong.qi@intel.com>
+Message-Id: <20200922052343.84388-1-yadong.qi@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20201106065122.403183-1-yadong.qi@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
 ---
  arch/x86/include/asm/vmx.h      |  1 +
  arch/x86/include/uapi/asm/vmx.h |  2 ++
- arch/x86/kvm/lapic.c            |  5 +++--
- arch/x86/kvm/vmx/nested.c       | 24 ++++++++++++++++++++----
- 4 files changed, 26 insertions(+), 6 deletions(-)
+ arch/x86/kvm/vmx/nested.c       | 55 ++++++++++++++++++++++++---------
+ 3 files changed, 44 insertions(+), 14 deletions(-)
 
 diff --git a/arch/x86/include/asm/vmx.h b/arch/x86/include/asm/vmx.h
 index 1835767aa335..0b51f769becc 100644
@@ -93,31 +89,8 @@ index 3eb8411ab60e..daa0c7e71784 100644
  	{ EXIT_REASON_PENDING_INTERRUPT,     "PENDING_INTERRUPT" }, \
  	{ EXIT_REASON_NMI_WINDOW,            "NMI_WINDOW" }, \
  	{ EXIT_REASON_TASK_SWITCH,           "TASK_SWITCH" }, \
-diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
-index 6920f1d3b66f..ff8382853c64 100644
---- a/arch/x86/kvm/lapic.c
-+++ b/arch/x86/kvm/lapic.c
-@@ -2707,7 +2707,7 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
- 
- 	/*
- 	 * INITs are latched while CPU is in specific states
--	 * (SMM, VMX non-root mode, SVM with GIF=0).
-+	 * (SMM, SVM with GIF=0).
- 	 * Because a CPU cannot be in these states immediately
- 	 * after it has processed an INIT signal (and thus in
- 	 * KVM_MP_STATE_INIT_RECEIVED state), just eat SIPIs
-@@ -2715,7 +2715,8 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
- 	 */
- 	if (is_smm(vcpu) || kvm_x86_ops->apic_init_signal_blocked(vcpu)) {
- 		WARN_ON_ONCE(vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED);
--		if (test_bit(KVM_APIC_SIPI, &apic->pending_events))
-+		if (test_bit(KVM_APIC_SIPI, &apic->pending_events) &&
-+		    !is_guest_mode(vcpu))
- 			clear_bit(KVM_APIC_SIPI, &apic->pending_events);
- 		return;
- 	}
 diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
-index 461981cf6dac..830e99224b81 100644
+index 461981cf6dac..8b56234a5014 100644
 --- a/arch/x86/kvm/vmx/nested.c
 +++ b/arch/x86/kvm/vmx/nested.c
 @@ -2763,7 +2763,8 @@ static int nested_vmx_check_vmcs_link_ptr(struct kvm_vcpu *vcpu,
@@ -130,48 +103,79 @@ index 461981cf6dac..830e99224b81 100644
  		return -EINVAL;
  
  	return 0;
-@@ -3282,7 +3283,8 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
- 	 * awakened by event injection or by an NMI-window VM-exit or
- 	 * by an interrupt-window VM-exit, halt the vcpu.
+@@ -3277,19 +3278,29 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
  	 */
--	if ((vmcs12->guest_activity_state == GUEST_ACTIVITY_HLT) &&
-+	if (((vmcs12->guest_activity_state == GUEST_ACTIVITY_HLT) ||
-+	    (vmcs12->guest_activity_state == GUEST_ACTIVITY_WAIT_SIPI)) &&
- 	    !(vmcs12->vm_entry_intr_info_field & INTR_INFO_VALID_MASK) &&
- 	    !(vmcs12->cpu_based_vm_exec_control & CPU_BASED_VIRTUAL_NMI_PENDING) &&
- 	    !((vmcs12->cpu_based_vm_exec_control & CPU_BASED_VIRTUAL_INTR_PENDING) &&
-@@ -3467,16 +3469,29 @@ static int vmx_check_nested_events(struct kvm_vcpu *vcpu)
- 	bool block_nested_events =
- 	    vmx->nested.nested_run_pending || kvm_event_needs_reinjection(vcpu);
- 	struct kvm_lapic *apic = vcpu->arch.apic;
-+	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ 	nested_cache_shadow_vmcs12(vcpu, vmcs12);
  
- 	if (lapic_in_kernel(vcpu) &&
- 		test_bit(KVM_APIC_INIT, &apic->pending_events)) {
+-	/*
+-	 * If we're entering a halted L2 vcpu and the L2 vcpu won't be
+-	 * awakened by event injection or by an NMI-window VM-exit or
+-	 * by an interrupt-window VM-exit, halt the vcpu.
+-	 */
+-	if ((vmcs12->guest_activity_state == GUEST_ACTIVITY_HLT) &&
+-	    !(vmcs12->vm_entry_intr_info_field & INTR_INFO_VALID_MASK) &&
+-	    !(vmcs12->cpu_based_vm_exec_control & CPU_BASED_VIRTUAL_NMI_PENDING) &&
+-	    !((vmcs12->cpu_based_vm_exec_control & CPU_BASED_VIRTUAL_INTR_PENDING) &&
+-	      (vmcs12->guest_rflags & X86_EFLAGS_IF))) {
++	switch (vmcs12->guest_activity_state) {
++	case GUEST_ACTIVITY_HLT:
++		/*
++		 * If we're entering a halted L2 vcpu and the L2 vcpu won't be
++		 * awakened by event injection or by an NMI-window VM-exit or
++		 * by an interrupt-window VM-exit, halt the vcpu.
++		 */
++		if (!(vmcs12->vm_entry_intr_info_field & INTR_INFO_VALID_MASK) &&
++		    !nested_cpu_has(vmcs12, CPU_BASED_VIRTUAL_NMI_PENDING) &&
++		    !(nested_cpu_has(vmcs12, CPU_BASED_VIRTUAL_INTR_PENDING) &&
++		      (vmcs12->guest_rflags & X86_EFLAGS_IF))) {
++			vmx->nested.nested_run_pending = 0;
++			return kvm_vcpu_halt(vcpu);
++		}
++		break;
++	case GUEST_ACTIVITY_WAIT_SIPI:
+ 		vmx->nested.nested_run_pending = 0;
+-		return kvm_vcpu_halt(vcpu);
++		vcpu->arch.mp_state = KVM_MP_STATE_INIT_RECEIVED;
++		break;
++	default:
++		break;
+ 	}
++
+ 	return 1;
+ 
+ vmentry_failed:
+@@ -3473,7 +3484,20 @@ static int vmx_check_nested_events(struct kvm_vcpu *vcpu)
  		if (block_nested_events)
  			return -EBUSY;
  		clear_bit(KVM_APIC_INIT, &apic->pending_events);
 -		nested_vmx_vmexit(vcpu, EXIT_REASON_INIT_SIGNAL, 0, 0);
-+		if (vmcs12->guest_activity_state != GUEST_ACTIVITY_WAIT_SIPI)
++		if (vcpu->arch.mp_state != KVM_MP_STATE_INIT_RECEIVED)
 +			nested_vmx_vmexit(vcpu, EXIT_REASON_INIT_SIGNAL, 0, 0);
- 		return 0;
- 	}
- 
++		return 0;
++	}
++
 +	if (lapic_in_kernel(vcpu) &&
 +	    test_bit(KVM_APIC_SIPI, &apic->pending_events)) {
 +		if (block_nested_events)
 +			return -EBUSY;
 +
 +		clear_bit(KVM_APIC_SIPI, &apic->pending_events);
-+		if (vmcs12->guest_activity_state == GUEST_ACTIVITY_WAIT_SIPI)
++		if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED)
 +			nested_vmx_vmexit(vcpu, EXIT_REASON_SIPI_SIGNAL, 0,
 +						apic->sipi_vector & 0xFFUL);
-+	}
-+
- 	if (vcpu->arch.exception.pending &&
- 		nested_vmx_check_exception(vcpu, &exit_qual)) {
- 		if (block_nested_events)
-@@ -5984,7 +5999,8 @@ void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps)
+ 		return 0;
+ 	}
+ 
+@@ -3684,6 +3708,8 @@ static void sync_vmcs02_to_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+ 
+ 	if (vcpu->arch.mp_state == KVM_MP_STATE_HALTED)
+ 		vmcs12->guest_activity_state = GUEST_ACTIVITY_HLT;
++	else if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED)
++		vmcs12->guest_activity_state = GUEST_ACTIVITY_WAIT_SIPI;
+ 	else
+ 		vmcs12->guest_activity_state = GUEST_ACTIVITY_ACTIVE;
+ 
+@@ -5984,7 +6010,8 @@ void nested_vmx_setup_ctls_msrs(struct nested_vmx_msrs *msrs, u32 ept_caps)
  	msrs->misc_low |=
  		MSR_IA32_VMX_MISC_VMWRITE_SHADOW_RO_FIELDS |
  		VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE |

@@ -1,7 +1,7 @@
-From 4c24581c73ad3d1b6ca179ca65eed38b6ac41898 Mon Sep 17 00:00:00 2001
+From 71bb549d37b5ad716e253c490692621aa7467470 Mon Sep 17 00:00:00 2001
 From: Liran Alon <liran.alon@oracle.com>
 Date: Mon, 11 Nov 2019 14:16:05 +0200
-Subject: [PATCH 1/2] KVM: VMX: Consume pending LAPIC INIT event when exit on
+Subject: [PATCH 2/4] KVM: VMX: Consume pending LAPIC INIT event when exit on
  INIT_SIGNAL
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

@@ -1,0 +1,109 @@
+From bd9ea1ac402615c2faa8c784caef6c073439c689 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Thu, 5 Nov 2020 11:20:49 -0500
+Subject: [PATCH 3/4] KVM: x86: fix apic_accept_events vs check_nested_events
+
+vmx_apic_init_signal_blocked is buggy in that it returns true
+even in VMX non-root mode.  In non-root mode, however, INITs
+are not latched, they just cause a vmexit.  Previously,
+KVM was waiting for them to be processed when kvm_apic_accept_events
+and in the meanwhile it ate the SIPIs that the processor received.
+
+However, in order to implement the wait-for-SIPI activity state,
+KVM will have to process KVM_APIC_SIPI in vmx_check_nested_events,
+and it will not be possible anymore to disregard SIPIs in non-root
+mode as the code is currently doing.
+
+By calling kvm_x86_ops.nested_ops->check_events, we can force a vmexit
+(with the side-effect of latching INITs) before incorrectly injecting
+an INIT or SIPI in a guest, and therefore vmx_apic_init_signal_blocked
+can do the right thing.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+---
+ arch/x86/kvm/lapic.c   | 30 ++++++++++++++++++++++++++----
+ arch/x86/kvm/vmx/vmx.c |  2 +-
+ 2 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index c62e34df0717..b5a61a157816 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2700,14 +2700,35 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 	u8 sipi_vector;
++	int r;
+ 	unsigned long pe;
+ 
+-	if (!lapic_in_kernel(vcpu) || !apic->pending_events)
++	if (!lapic_in_kernel(vcpu))
++		return;
++
++	/*
++	 * Read pending events before calling the check_events
++	 * callback.
++	 */
++	pe = smp_load_acquire(&apic->pending_events);
++	if (!pe)
+ 		return;
+ 
++	if (is_guest_mode(vcpu)) {
++		r = kvm_x86_ops->check_nested_events(vcpu);
++		if (r < 0)
++			return;
++		/*
++		 * If an event has happened and caused a vmexit,
++		 * we know INITs are latched and therefore
++		 * we will not incorrectly deliver an APIC
++		 * event instead of a vmexit.
++		 */
++	}
++
+ 	/*
+ 	 * INITs are latched while CPU is in specific states
+-	 * (SMM, VMX non-root mode, SVM with GIF=0).
++	 * (SMM, VMX root mode, SVM with GIF=0).
+ 	 * Because a CPU cannot be in these states immediately
+ 	 * after it has processed an INIT signal (and thus in
+ 	 * KVM_MP_STATE_INIT_RECEIVED state), just eat SIPIs
+@@ -2715,13 +2736,13 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ 	 */
+ 	if (kvm_vcpu_latch_init(vcpu)) {
+ 		WARN_ON_ONCE(vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED);
+-		if (test_bit(KVM_APIC_SIPI, &apic->pending_events))
++		if (test_bit(KVM_APIC_SIPI, &pe))
+ 			clear_bit(KVM_APIC_SIPI, &apic->pending_events);
+ 		return;
+ 	}
+ 
+-	pe = xchg(&apic->pending_events, 0);
+ 	if (test_bit(KVM_APIC_INIT, &pe)) {
++		clear_bit(KVM_APIC_INIT, &apic->pending_events);
+ 		kvm_vcpu_reset(vcpu, true);
+ 		if (kvm_vcpu_is_bsp(apic->vcpu))
+ 			vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+@@ -2730,6 +2751,7 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ 	}
+ 	if (test_bit(KVM_APIC_SIPI, &pe) &&
+ 	    vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
++		clear_bit(KVM_APIC_SIPI, &apic->pending_events);
+ 		/* evaluate pending_events before reading the vector */
+ 		smp_rmb();
+ 		sipi_vector = apic->sipi_vector;
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 27f317c029cc..65cab1053da8 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7597,7 +7597,7 @@ static bool vmx_need_emulation_on_page_fault(struct kvm_vcpu *vcpu)
+ 
+ static bool vmx_apic_init_signal_blocked(struct kvm_vcpu *vcpu)
+ {
+-	return to_vmx(vcpu)->nested.vmxon;
++	return to_vmx(vcpu)->nested.vmxon && !is_guest_mode(vcpu);
+ }
+ 
+ static __init int hardware_setup(void)
+-- 
+2.25.1
+
